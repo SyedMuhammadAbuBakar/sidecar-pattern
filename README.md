@@ -1,81 +1,87 @@
+# Kubernetes Sidecar Pattern — nginx + git-sync
+
 A working example of the sidecar pattern in Kubernetes using nginx and git-sync.
 
-What is the Sidecar Pattern?
+---
 
-A sidecar is a helper container that runs alongside the main application container in the same pod. They share the same network namespace and can share volumes via emptyDir.
+## What is the Sidecar Pattern?
+
+A sidecar is a helper container that runs alongside the main application container in the same pod. They share the same network namespace and can share volumes via `emptyDir`.
 
 The main app doesn't need to know the sidecar exists — they just share a filesystem.
 
+---
 
-What We Built
+## What We Built
 
+- **nginx** — serves web content from a shared volume
+- **git-sync** — clones a git repo and keeps it in sync every 60 seconds
 
-nginx — serves web content from a shared volume
-git-sync — clones a git repo and keeps it in sync every 60 seconds
-
-
+```
 GitHub repo
       ↓ git-sync clones + pulls every 60s
 emptyDir volume (shared between containers)
       ↓ nginx serves files
 Browser
+```
 
+---
 
-How git-sync Works
+## How git-sync Works
 
-git-sync uses worktrees for atomic updates. Instead of overwriting files in place (risky — nginx might read half-written files), it:
+git-sync uses **worktrees** for atomic updates. Instead of overwriting files in place (risky — nginx might read half-written files), it:
 
-
-Prepares the new commit in a fresh directory .worktrees/newcommit/
-Atomically flips a symlink: current → newcommit
-nginx reads from current which always points to the latest complete version
-
+1. Prepares the new commit in a fresh directory `.worktrees/newcommit/`
+2. Atomically flips a symlink: `current → newcommit`
+3. nginx reads from `current` which always points to the latest complete version
 
 This means nginx never sees a partially updated state.
 
+---
 
-Problems We Hit
+## Problems We Hit
 
-Problem 1 — 403 Forbidden (permissions)
+### Problem 1 — 403 Forbidden (permissions)
+git-sync writes files as user `65533`. nginx runs as a different user and couldn't read them.
 
-git-sync writes files as user 65533. nginx runs as a different user and couldn't read them.
-
-Fix — fsGroup in pod securityContext:
-
-yamlsecurityContext:
+**Fix — `fsGroup` in pod securityContext:**
+```yaml
+securityContext:
   fsGroup: 101
-
+```
 Makes the shared volume group-owned by GID 101, which is added to all containers in the pod.
 
-Problem 2 — 403 Forbidden (wrong path)
+### Problem 2 — 403 Forbidden (wrong path)
+nginx default config points to `/usr/share/nginx/html` but files land at `/usr/share/nginx/html/current`. Also no `index.html` exists in a Go repo.
 
-nginx default config points to /usr/share/nginx/html but files land at /usr/share/nginx/html/current. Also no index.html exists in a Go repo.
-
-Fix — ConfigMap to override nginx config:
-
-yamlserver {
+**Fix — ConfigMap to override nginx config:**
+```yaml
+server {
   listen 80;
   location / {
     root /usr/share/nginx/html/current;
     autoindex on;
   }
 }
+```
+`autoindex on` shows a directory listing when there's no `index.html`.
 
-autoindex on shows a directory listing when there's no index.html.
+---
 
+## Why Not Just Use Apache (httpd)?
 
-Why Not Just Use Apache (httpd)?
+The [official git-sync Kubernetes docs](https://github.com/kubernetes/git-sync/blob/master/docs/kubernetes.md) use `httpd:alpine` for simplicity. They acknowledge it themselves:
 
-The official git-sync Kubernetes docs use httpd:alpine for simplicity. They acknowledge it themselves:
+*"NOTE: apache runs as root to expose port 80, and there's not a trivial flag to change that. Real servers should not run as root when possible."*
 
-"NOTE: apache runs as root to expose port 80, and there's not a trivial flag to change that. Real servers should not run as root when possible."
+Taking their own advice, we used nginx with `fsGroup` and a ConfigMap instead — which requires a bit more config but follows the non-root recommendation for real servers.
 
-Taking their own advice, we used nginx with fsGroup and a ConfigMap instead — which requires a bit more config but follows the non-root recommendation for real servers.
+---
 
+## Final YAML
 
-Final YAML
-
-yamlapiVersion: v1
+```yaml
+apiVersion: v1
 kind: ConfigMap
 metadata:
   name: nginx-config
@@ -128,20 +134,24 @@ spec:
     - name: nginx-config
       configMap:
         name: nginx-config
+```
 
+---
 
-Expose and Access
+## Expose and Access
 
-bashkubectl apply -f sidecar.yaml
+```bash
+kubectl apply -f sidecar.yaml
 kubectl expose pod nginx-gitsync --port=80 --type=NodePort
 minikube service nginx-gitsync --url
+```
 
+---
 
-Key Takeaways
+## Key Takeaways
 
-
-emptyDir is the bridge between sidecar containers — same volume, different mount paths
-git-sync uses worktrees + symlinks for atomic updates — nginx never sees incomplete state
-fsGroup solves cross-container permission issues on shared volumes
-ConfigMap overrides nginx config without rebuilding the image
-The official docs use Apache for simplicity and suggest avoiding root — we followed that advice using nginx + fsGroup
+- `emptyDir` is the bridge between sidecar containers — same volume, different mount paths
+- git-sync uses worktrees + symlinks for atomic updates — nginx never sees incomplete state
+- `fsGroup` solves cross-container permission issues on shared volumes
+- ConfigMap overrides nginx config without rebuilding the image
+- The official docs use Apache for simplicity and suggest avoiding root — we followed that advice using nginx + fsGroup
